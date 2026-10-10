@@ -247,6 +247,22 @@ printf '%s' "$nocwd" | "$MODS" 2>/dev/null; expect_eq "no cwd: falls back to the
 nolist=$(jq -n --arg cwd "$N" --arg f "$N/main.tf" --arg t "$(tf cloudposse/vpc/aws)" '{cwd: $cwd, tool_input: {file_path: $f, content: $t}}')
 printf '%s' "$nolist" | HOME="$WORK/nohome" "$MODS" 2>/dev/null; expect_eq "hook mode, no allowlist: not enforced" "$?" 0
 
+E="$WORK/emptylist"; new_repo "$E"; mkdir -p "$E/.opencode/references"
+echo '# nothing approved yet' > "$E/.opencode/references/approved-modules.txt"
+empty=$(jq -n --arg cwd "$E" --arg f "$E/main.tf" --arg t "$(tf terraform-aws-modules/vpc/aws)" '{cwd: $cwd, tool_input: {file_path: $f, content: $t}}')
+printf '%s' "$empty" | "$MODS" 2>/dev/null; expect_eq "empty allowlist blocks every module" "$?" 2
+# Unreadable allowlist: the module is approved, so only the read failure can block it.
+# Skipped as root, which can read a mode-000 file.
+if [ "$(id -u)" -ne 0 ]; then
+  echo 'terraform-aws-modules/vpc/aws' > "$E/.opencode/references/approved-modules.txt"
+  chmod 000 "$E/.opencode/references/approved-modules.txt"
+  printf '%s' "$empty" | "$MODS" 2>"$WORK/stderr"; expect_eq "unreadable allowlist blocks" "$?" 2
+  grep -q "cannot read the Terraform module allowlist" "$WORK/stderr" && ok "unreadable allowlist message is shown" || bad "unreadable allowlist message"
+  tf terraform-aws-modules/vpc/aws > "$E/main.tf"
+  "$MODS" "$E" >/dev/null 2>&1; expect_eq "scan mode, unreadable allowlist: exit 2" "$?" 2
+  chmod 644 "$E/.opencode/references/approved-modules.txt"
+fi
+
 badw=$(jq -n --arg cwd "$M" --arg f "$M/main.tf" --arg t "$(tf cloudposse/vpc/aws)" '{cwd: $cwd, tool_input: {file_path: $f, content: $t}}')
 printf '%s' "$badw" | PATH="$WORK/bin-nojq" "$MODS" 2>/dev/null; expect_eq "module gate python3 fallback blocks" "$?" 2
 printf '%s' "$badw" | PATH="$WORK/bin-none" "$MODS" 2>/dev/null; expect_eq "module gate without parsers fails closed" "$?" 2
@@ -742,7 +758,8 @@ put security-reviewer "${TABLE}| low | a.tf:1 | x |\n"
 expect_eq "malformed row fails after the re-run" "$(mf main security-reviewer)" 1
 mf --reset >/dev/null
 put security-reviewer "No findings."
-touch -d '1 hour ago' "$MR/.opencode/.review/security-reviewer.md"
+# portable "1 hour ago" (BSD touch has no -d with relative dates)
+python3 -c 'import os, sys, time; t = time.time() - 3600; os.utime(sys.argv[1], (t, t))' "$MR/.opencode/.review/security-reviewer.md"
 expect_eq "a result from before --reset doesn't count" "$(mf main security-reviewer)" 3
 put security-reviewer "\`\`\`\nNo findings.\n\`\`\`"
 expect_eq "a fenced 'No findings.' passes" "$(mf main security-reviewer)" 0

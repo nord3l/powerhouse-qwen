@@ -6,6 +6,7 @@
 #   module source (HCL `source = "..."` anywhere on a line, or JSON `"source": "..."`).
 # Scan mode: check-module-sources.sh <file-or-dir>...   (for CI, /review, or by hand)
 #   Exit 1 and list violations if any *.tf or *.tf.json under the paths uses an unapproved source.
+#   Exit 2 if the allowlist exists but can't be read (hook mode blocks in that case too).
 #
 # Always allowed: local modules (./, ../). Ignored: provider sources (ns/type, host/ns/type).
 # Sources are matched as bash globs after stripping ?query, //subdir and a leading
@@ -22,8 +23,10 @@ find_allowlist() {
   return 1
 }
 
-load_patterns() { # strips comments and blank lines
-  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^$' || true
+load_patterns() { # strips comments and blank lines; fails if the file can't be read
+  local out
+  out=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1") || return 1
+  printf '%s\n' "$out" | grep -v '^$' || true
 }
 
 normalise() {
@@ -46,16 +49,20 @@ is_module_source() {
   return 0
 }
 
-# check_text <text> <allowlist> -> prints unapproved sources, one per line
+# check_text <text> <allowlist> -> prints unapproved sources, one per line;
+# returns 1 if the allowlist can't be read. Bash 3.2 compatible (no mapfile).
 check_text() {
-  local text="$1" list="$2" raw src pat ok
-  local -a patterns
-  mapfile -t patterns < <(load_patterns "$list")
+  local text="$1" list="$2" raw src pat ok loaded
+  local -a patterns=()
+  loaded=$(load_patterns "$list") || return 1
+  while IFS= read -r pat; do
+    [ -n "$pat" ] && patterns+=("$pat")
+  done <<< "$loaded"
   while IFS= read -r raw; do
     is_module_source "$raw" || continue
     src=$(normalise "$raw")
     ok=1
-    for pat in "${patterns[@]}"; do
+    for pat in ${patterns[@]+"${patterns[@]}"}; do
       # shellcheck disable=SC2053  # glob match on purpose
       if [[ "$src" == $pat ]]; then ok=0; break; fi
     done
@@ -70,11 +77,13 @@ if [ "$#" -gt 0 ]; then
   list=$(find_allowlist "$1") || { echo "no approved-modules.txt found; nothing enforced" >&2; exit 0; }
   status=0
   while IFS= read -r -d '' f; do
+    found=$(check_text "$(cat "$f")" "$list") || { echo "cannot read the module allowlist $list" >&2; exit 2; }
     while IFS= read -r bad; do
+      [ -n "$bad" ] || continue
       line=$(grep -nF "\"$bad\"" "$f" | head -1 | cut -d: -f1)
       echo "$f:${line:-?}: unapproved module source: $bad"
       status=1
-    done < <(check_text "$(cat "$f")" "$list")
+    done <<< "$found"
   done < <(find "$@" -type f \( -name '*.tf' -o -name '*.tf.json' \) -not -path '*/.terraform/*' -print0)
   exit "$status"
 fi
@@ -121,7 +130,10 @@ text=$(get text)
 cwd=$(get cwd)
 list=$(find_allowlist "${cwd:-$(dirname "$file")}") || exit 0
 
-bad=$(check_text "$text" "$list")
+if ! bad=$(check_text "$text" "$list"); then
+  echo "Blocked: cannot read the Terraform module allowlist $list, so $file can't be checked." >&2
+  exit 2
+fi
 [ -z "$bad" ] && exit 0
 
 {
