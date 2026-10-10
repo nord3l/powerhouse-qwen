@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# ph: run powerhouse-qwen from the Mac terminal. opencode and the agents run in the OrbStack
+# container; LM Studio runs on the Mac. Everything they print shows here, live.
+#
+#   ph [-C repo] [tui]                 opencode TUI (approvals, subagents, everything)
+#   ph [-C repo] review [args]         /review in the TUI
+#   ph [-C repo] build "<requirement>"  /build in the TUI
+#   ph [-C repo] remediate [args]      /remediate in the TUI
+#   ph [-C repo] ask [@agent] "<msg>"  one message, printed as it streams (no TUI)
+#   ph [-C repo] continue "<msg>"      continue the last session, printed (e.g. "approve")
+#   ph [-C repo] --print review|build|remediate [args]
+#                                      the command without the TUI; permission prompts are
+#                                      auto-rejected, so use it only for scripted runs
+#   ph [-C repo] results               saved reviewer tables and the recorded PASS/FAIL
+#   ph [-C repo] doctor                powerhouse-doctor in the container + lms ps here
+#   ph [-C repo] shell                 a shell in the container
+#   ph logs [n]                        list saved transcripts, or print the nth newest
+#
+# repo: a folder under /root/code in the container (default: powerhouse-scratch).
+# Environment: PH_CONTAINER (powerhouse-qwen-test), PH_MODEL (qwen3-coder-30b-a3b-instruct),
+#              PH_CONTEXT (24576), PH_PARALLEL (1).
+# Bash 3.2 compatible: macOS runs this with /bin/bash.
+set -u
+
+container=${PH_CONTAINER:-powerhouse-qwen-test}
+model=${PH_MODEL:-qwen3-coder-30b-a3b-instruct}
+want_ctx=${PH_CONTEXT:-24576}
+want_par=${PH_PARALLEL:-1}
+repo=powerhouse-scratch
+logdir=/root/.ph-logs
+
+die() { echo "ph: $*" >&2; exit 1; }
+note() { printf '\033[2mph: %s\033[0m\n' "$*" >&2; }
+usage() { sed -n '2,/^set -u/p' "$0" | sed -e '/^set -u/d' -e 's/^# \{0,1\}//'; }
+
+# ------------------------------------------------------------------ preflight
+preflight() {
+  command -v docker >/dev/null 2>&1 || die "docker not found (install OrbStack)"
+  if ! docker info >/dev/null 2>&1; then
+    note "starting OrbStack"
+    orb start >/dev/null 2>&1 || die "OrbStack didn't start; open it from Applications"
+    local i=0
+    while ! docker info >/dev/null 2>&1; do
+      i=$((i + 1)); [ "$i" -gt 30 ] && die "docker isn't answering after 60 s"
+      sleep 2
+    done
+  fi
+  local state
+  state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null) \
+    || die "container $container doesn't exist; see 'Rebuild the container' in LOCAL-QWEN.md"
+  if [ "$state" != true ]; then
+    note "starting container $container"
+    docker start "$container" >/dev/null || die "couldn't start $container"
+  fi
+  check_model
+}
+
+check_model() { # warn only: loading the model is a ~12 GB decision for the user
+  command -v lms >/dev/null 2>&1 || { note "lms not found; can't check LM Studio"; return 0; }
+  local row ctx par n
+  row=$(lms ps --json 2>/dev/null) || { note "LM Studio isn't answering (lms server start)"; return 0; }
+  n=$(printf '%s' "$row" | jq 'length' 2>/dev/null || echo "?")
+  ctx=$(printf '%s' "$row" | jq -r --arg m "$model" '.[] | select(.identifier == $m) | .contextLength' 2>/dev/null)
+  par=$(printf '%s' "$row" | jq -r --arg m "$model" '.[] | select(.identifier == $m) | .parallel' 2>/dev/null)
+  if [ -z "$ctx" ]; then
+    note "WARNING: $model isn't loaded. Load it with:"
+    note "  lms load $model --context-length $want_ctx --parallel $want_par -y"
+  elif [ "$ctx" != "$want_ctx" ] || [ "$par" != "$want_par" ]; then
+    note "WARNING: $model is loaded with context $ctx, parallel $par (want $want_ctx, $want_par). Reload:"
+    note "  lms unload --all && lms load $model --context-length $want_ctx --parallel $want_par -y"
+  elif [ "$n" != 1 ]; then
+    note "WARNING: $n models loaded; unload all but $model (each holds its own weights)"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ running things
+# in_repo <cmd...>: run in the repo inside the container, with a TTY when we have one
+in_repo() {
+  local flags=(-w "/root/code/$repo")
+  [ -t 0 ] && flags+=(-i)
+  [ -t 1 ] && flags+=(-t)
+  docker exec "${flags[@]}" "$container" "$@"
+}
+
+# logged <name> <cmd...>: like in_repo, and keeps a transcript in $logdir
+logged() {
+  local name="$1"; shift
+  local log quoted
+  log="$logdir/$(date +%Y%m%d-%H%M%S)-$name.log"
+  quoted=$(printf '%q ' "$@")
+  in_repo bash -c "mkdir -p $logdir && exec script -qefc $(printf '%q' "$quoted") $(printf '%q' "$log")"
+  local rc=$?
+  note "transcript: $log (ph logs 1)"
+  return "$rc"
+}
+
+need_repo() {
+  docker exec "$container" test -d "/root/code/$repo" \
+    || die "no repo /root/code/$repo in the container (ph shell, then clone or create it under ~/code)"
+}
+
+results() {
+  docker exec -w "/root/code/$repo" "$container" bash -c '
+    shopt -s nullglob
+    files=(.opencode/.review/*.md)
+    [ ${#files[@]} -gt 0 ] || { echo "no saved reviewer output (run ph review)"; exit 0; }
+    for f in "${files[@]}"; do printf "\n=== %s\n" "$(basename "$f" .md)"; cat "$f"; echo; done
+    printf "\n=== recorded result (.opencode/.review-status)\n"
+    cat .opencode/.review-status 2>/dev/null || echo "none recorded"
+    printf "HEAD %s\n" "$(git rev-parse --short HEAD)"'
+}
+
+# ------------------------------------------------------------------ main
+[ "${1:-}" = -h ] || [ "${1:-}" = --help ] || [ "${1:-}" = help ] && { usage; exit 0; }
+if [ "${1:-}" = -C ]; then
+  [ -n "${2:-}" ] || die "-C needs a repo name"
+  repo=$2; shift 2
+fi
+print=0
+[ "${1:-}" = --print ] && { print=1; shift; }
+cmd=${1:-tui}; [ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+  logs)
+    preflight
+    if [ -z "${1:-}" ]; then
+      docker exec "$container" bash -c "ls -1t $logdir 2>/dev/null | head -20 | nl" || true
+    else
+      case "$1" in *[!0-9]*) die "logs takes a number" ;; esac
+      docker exec "$container" bash -c "f=\$(ls -1t $logdir | sed -n '${1}p'); [ -n \"\$f\" ] && cat \"$logdir/\$f\" || echo 'no such transcript'"
+    fi ;;
+  shell)  preflight; need_repo; in_repo bash -l ;;
+  doctor)
+    preflight; need_repo
+    in_repo .opencode/bin/powerhouse-doctor; rc=$?
+    echo; echo "LM Studio (this Mac):"; lms ps 2>/dev/null | sed '/^$/d' || echo "  lms not available"
+    exit "$rc" ;;
+  results) preflight; need_repo; results ;;
+  tui)    preflight; need_repo; [ -t 1 ] || die "tui needs a terminal"; in_repo opencode ;;
+  review|build|remediate)
+    preflight; need_repo
+    if [ "$print" -eq 1 ]; then
+      note "--print: permission prompts are auto-rejected; a reviewer that needs one will fail"
+      logged "$cmd" opencode run --command "$cmd" "$@"; rc=$?
+    else
+      [ -t 1 ] || die "$cmd runs in the TUI and needs a terminal (or use: ph --print $cmd)"
+      in_repo opencode --prompt "/$cmd${*:+ $*}"; rc=$?
+    fi
+    [ "$cmd" = review ] && results
+    exit "$rc" ;;
+  ask)
+    preflight; need_repo
+    agent=""
+    case "${1:-}" in @*) agent=${1#@}; shift ;; esac
+    [ "$#" -gt 0 ] || die 'ask needs a message: ph ask [@agent] "<message>"'
+    if [ -n "$agent" ]; then
+      # All powerhouse agents are subagents, which `opencode run --agent` won't run (it falls
+      # back to the primary). Have the primary hand the message over, as @agent does in the TUI.
+      logged ask opencode run "Use the task tool to pass this to the $agent subagent unchanged, then report its answer. Don't run any of it yourself. Message for $agent: $*"
+    else
+      logged ask opencode run "$*"
+    fi ;;
+  continue)
+    preflight; need_repo
+    [ "$#" -gt 0 ] || die 'continue needs a message: ph continue "approve"'
+    logged continue opencode run --continue "$*" ;;
+  *) usage >&2; exit 2 ;;
+esac
