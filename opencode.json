@@ -1,0 +1,60 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LM Studio (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:1234/v1"
+      },
+      "models": {
+        "qwen3-coder-30b-a3b-instruct": {
+          "name": "Qwen3 Coder 30B A3B (local)",
+          "attachment": true,
+          "tool_call": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 24576,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "lmstudio/qwen3-coder-30b-a3b-instruct",
+  "small_model": "lmstudio/qwen3-coder-30b-a3b-instruct",
+  "permission": {
+    "skill": "deny",
+    "webfetch": "deny",
+    "todowrite": "deny",
+    "edit": {
+      "*": "allow",
+      "*approved-modules.txt": "ask"
+    }
+  },
+  "tools": {
+    "aws-docs_*": false
+  },
+  "mcp": {
+    "aws-docs": {
+      "type": "local",
+      "command": ["uvx", "--exclude-newer", "2026-10-01T00:00:00Z", "awslabs.aws-documentation-mcp-server@1.2.2"],
+      "environment": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "AWS_DOCUMENTATION_PARTITION": "aws"
+      },
+      "enabled": false
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "tool_output": {
+    "max_lines": 200,
+    "max_bytes": 16384
+  }
+}

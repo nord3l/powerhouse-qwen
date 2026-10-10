@@ -1,0 +1,29 @@
+# Approved Terraform module sources.
+#
+# One bash glob per line; '#' starts a comment. Sources are matched after stripping
+# ?ref=..., //subdir and a leading registry.terraform.io/, so
+#   "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+# matches the entry "terraform-aws-modules/iam/aws".
+#
+# Always allowed: local modules (./modules/..., ../shared/...).
+# Not checked here: provider sources in required_providers (hashicorp/aws etc.).
+# Version pinning is still required for every module (iac-reviewer checks it).
+#
+# Enforced by .opencode/hooks/check-module-sources.sh (blocks edit/write of *.tf, via the powerhouse plugin) and by
+# iac-reviewer during /review. opencode asks for your approval before editing this file.
+
+# --- terraform-aws-modules (https://github.com/terraform-aws-modules) ---
+terraform-aws-modules/vpc/aws
+terraform-aws-modules/eks/aws
+terraform-aws-modules/iam/aws
+terraform-aws-modules/s3-bucket/aws
+terraform-aws-modules/rds/aws
+terraform-aws-modules/rds-aurora/aws
+terraform-aws-modules/security-group/aws
+terraform-aws-modules/kms/aws
+
+# Uncomment to trust every module in the namespace:
+# terraform-aws-modules/*/aws
+
+# Your organisation's modules over git (pin with ?ref=<tag or sha>):
+# git::https://github.com/your-org/terraform-*

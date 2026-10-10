@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Merges the /review panel's results and records PASS/FAIL for the push gate.
+
+  merge-findings --reset                     start of /review: forget earlier results
+  merge-findings <base> <reviewer>...        merge, print the report, record pass|fail
+
+The powerhouse plugin saves each reviewer's answer to .opencode/.review/<reviewer>.md as the
+task finishes. This script, not the model, validates those answers, merges and de-duplicates
+the rows, sorts them, decides PASS/FAIL and calls hooks/review-status.sh, so a small local
+model can't misjudge the result. A reviewer with no answer, or an answer that is neither a
+findings table nor exactly "No findings.", becomes a high row, so an incomplete review fails.
+Exit status: 0 PASS, 1 FAIL, 3 when reviewers need a re-run (see "Re-run:"), 64 usage.
+"""
+import os
+import re
+import subprocess
+import sys
+
+ALL = ["security-reviewer", "iac-reviewer", "k8s-reviewer", "war-reviewer", "test-gap-reviewer", "frugal-reviewer"]
+SEVERITIES = ["critical", "high", "medium", "low"]
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
+
+
+def split_row(line):
+    """Cells of a markdown table row; a | inside `code` or escaped as \\| stays in its cell."""
+    cells, cur, code = [], "", False
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s) and s[i + 1] == "|":
+            cur += "|"
+            i += 2
+            continue
+        if c == "`":
+            code = not code
+        if c == "|" and not code:
+            cells.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    cells.append(cur.strip())
+    return cells
+
+
+def parse(text, reviewer):
+    """Returns (rows, error). rows: dicts with severity, location, issue, fix, source."""
+    body = re.sub(r"^```[a-z]*\s*$", "", text.strip(), flags=re.M).strip()
+    if re.fullmatch(r"(?i)no findings\.?", body):
+        return [], None
+    lines = [l for l in body.splitlines() if l.strip().startswith("|")]
+    if not lines:
+        return None, "neither a findings table nor exactly 'No findings.'"
+    header = [h.lower() for h in split_row(lines[0])]
+    need = ["severity", "file:line", "issue", "fix"]
+    if not all(h in header for h in need):
+        return None, "table header must have the columns severity | file:line | issue | fix"
+    idx = {h: header.index(h) for h in need}
+    law = header.index("law") if "law" in header else None
+    rows = []
+    for line in lines[1:]:
+        cells = split_row(line)
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        if len(cells) != len(header):
+            return None, "a row has %d cells, expected %d" % (len(cells), len(header))
+        sev = cells[idx["severity"]].strip("* ").lower()
+        if sev not in SEVERITIES:
+            return None, "unknown severity %r" % cells[idx["severity"]]
+        source = reviewer
+        if law is not None and cells[law]:
+            numeral = re.match(r"([IVX]+)\b", cells[law].strip())
+            source = "%s (Law %s)" % (reviewer, numeral.group(1) if numeral else cells[law])
+        rows.append({"severity": sev, "location": cells[idx["file:line"]].strip("` "),
+                     "issue": cells[idx["issue"]], "fix": cells[idx["fix"]], "sources": [source]})
+    return rows, None
+
+
+def loc(row):
+    m = re.match(r"^(.*?)(?::(\d+))?(?:[-–]\d+)?$", row["location"])
+    return m.group(1), int(m.group(2)) if m.group(2) else None
+
+
+def words(text):
+    text = re.sub(r"^\s*\[[^\]]*\]", "", text)  # war-reviewer's [Pillar] prefix
+    return set(re.findall(r"[a-z0-9_.:/*-]{3,}", text.lower()))
+
+
+def same_problem(a, b):
+    fa, la = loc(a)
+    fb, lb = loc(b)
+    if fa != fb or fa in ("", "-"):
+        return False
+    if la is None or lb is None:
+        near = la == lb
+    else:
+        near = abs(la - lb) <= 3
+    if not near:
+        return False
+    # A reviewer never duplicates itself, and only clearly similar wording counts as the same
+    # problem: a missed merge just shows a row twice, a wrong one would hide a finding.
+    if {s.split()[0] for s in a["sources"]} & {s.split()[0] for s in b["sources"]}:
+        return False
+    wa, wb = words(a["issue"]), words(b["issue"])
+    overlap = len(wa & wb) / max(1, len(wa | wb))
+    return overlap >= (0.6 if la == lb else 0.7)
+
+
+def merge(rows):
+    out = []
+    for r in rows:
+        for m in out:
+            if same_problem(m, r) and all(same_problem(dict(m, sources=[s]), r) for s in m["sources"]):
+                if SEVERITIES.index(r["severity"]) < SEVERITIES.index(m["severity"]):
+                    m["severity"], m["issue"], m["fix"] = r["severity"], r["issue"], r["fix"]
+                for s in r["sources"]:
+                    if s not in m["sources"]:
+                        m["sources"].append(s)
+                break
+        else:
+            out.append(dict(r, sources=list(r["sources"])))
+
+    def key(r):
+        f, l = loc(r)
+        return (SEVERITIES.index(r["severity"]), f, l if l is not None else -1)
+    return sorted(out, key=key)
+
+
+def cell(text):
+    return text.replace("\n", " ").replace("|", "\\|")
+
+
+def main(argv):
+    root = git("rev-parse", "--show-toplevel")
+    if not root:
+        print("merge-findings: not inside a git repository", file=sys.stderr)
+        return 64
+    review_dir = os.path.join(root, ".opencode", ".review")
+    started = os.path.join(review_dir, ".started")
+
+    if argv[:1] == ["--reset"]:
+        os.makedirs(review_dir, exist_ok=True)
+        for f in os.listdir(review_dir):
+            os.remove(os.path.join(review_dir, f))
+        open(started, "w").close()
+        exclude = git("rev-parse", "--git-path", "info/exclude")
+        if exclude and subprocess.run(["git", "check-ignore", "-q", ".opencode/.review/x"], cwd=root).returncode != 0:
+            path = os.path.join(root, exclude) if not os.path.isabs(exclude) else exclude
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a") as f:
+                f.write(".opencode/.review/\n")
+        print("merge-findings: ready; run the reviewers, then merge-findings <base> <reviewers...>")
+        return 0
+
+    if len(argv) < 2 or any(r not in ALL for r in argv[1:]):
+        print("usage: merge-findings --reset | merge-findings <base> <reviewer>...  (reviewers: %s)" % " ".join(ALL),
+              file=sys.stderr)
+        return 64
+    base, reviewers = argv[0], list(dict.fromkeys(argv[1:]))
+    since = os.path.getmtime(started) if os.path.exists(started) else None
+
+    rows, rerun = [], []
+    for r in reviewers:
+        path = os.path.join(review_dir, r + ".md")
+        if since is None or not os.path.exists(path) or os.path.getmtime(path) < since:
+            rerun.append((r, "no result recorded"))
+            continue
+        parsed, error = parse(open(path).read(), r)
+        if error:
+            rerun.append((r, error))
+        else:
+            rows += parsed
+
+    # One retry per review, as before: the first time reviewers are missing or invalid, ask for a
+    # re-run instead of failing; the second time they become high rows.
+    if rerun and not os.path.exists(os.path.join(review_dir, ".retried")):
+        open(os.path.join(review_dir, ".retried"), "w").close()
+        print("Re-run: " + " ".join(r for r, _ in rerun))
+        for r, why in rerun:
+            print("  %s: %s" % (r, why))
+        print("Run each listed reviewer once more (one at a time), then run this command again.")
+        return 3
+    for r, why in rerun:
+        rows.append({"severity": "high", "location": "-", "issue": "%s did not return a valid result (%s)" % (r, why),
+                     "fix": "re-run /review", "sources": [r]})
+
+    merged = merge(rows)
+    failed = any(r["severity"] in ("critical", "high") for r in merged)
+    result = "fail" if failed else "pass"
+
+    status = subprocess.run(["bash", os.path.join(HERE, "..", "hooks", "review-status.sh"), result],
+                            cwd=root, capture_output=True, text=True)
+    if status.returncode != 0:
+        print("merge-findings: could not record the result: %s" % status.stderr.strip(), file=sys.stderr)
+        return 1
+
+    head = git("rev-parse", "--short=7", "HEAD") or "none"
+    print("## Review: %s  (HEAD %s, base %s)" % (result.upper(), head, base))
+    if merged:
+        print("| severity | file:line | issue | fix | source |")
+        print("|---|---|---|---|---|")
+        for r in merged:
+            print("| %s | %s | %s | %s | %s |" % (r["severity"], cell(r["location"]), cell(r["issue"]), cell(r["fix"]),
+                                                 ", ".join(r["sources"])))
+    else:
+        print("No findings.")
+    print()
+    skipped = [r for r in ALL if r not in reviewers]
+    print("Ran: %s · Skipped (no matching files): %s" % (", ".join(reviewers), ", ".join(skipped) or "none"))
+    print()
+    print("Totals: " + " · ".join("%s %d" % (s, sum(r["severity"] == s for r in merged)) for s in SEVERITIES))
+    if git("status", "--porcelain"):
+        print()
+        print("Reviewed the working tree; the pass also covers the commit if you commit exactly these changes.")
+    print(status.stdout.strip())
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# `cond && okay ... || fail ...` is safe here: okay always succeeds.
+# shellcheck disable=SC2015
+# Checks that opencode, LM Studio and powerhouse agree with each other on this machine.
+#
+#   powerhouse-doctor            run from the repo (reads ./opencode.json, then the global one)
+#
+# Checks: the tools the hooks need, the plugin install, the LM Studio server, that the configured
+# model is the only one loaded, that LM Studio's context length matches opencode's limit.context,
+# and a memory estimate for the weights plus KV cache. Exit 1 if anything is wrong.
+set -u
+
+problems=0 warnings=0
+okay() { printf '  ok    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
+fail() { printf '  FAIL  %s\n' "$*"; problems=$((problems + 1)); }
+
+# Qwen3-Coder-30B-A3B: 48 layers x 4 KV heads x 128 dims x 2 (K and V) x 2 bytes = 96 KiB per token at fp16.
+KV_BYTES_PER_TOKEN=98304
+
+echo "Tools"
+for t in git jq python3 curl; do
+  if command -v "$t" >/dev/null 2>&1; then okay "$t"; else fail "$t not found (the hooks and this check need it)"; fi
+done
+command -v opencode >/dev/null 2>&1 && okay "opencode $(opencode --version 2>/dev/null | head -1)" || warn "opencode not on PATH"
+
+echo "Install"
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+global="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+if [ -f "$root/.opencode/plugin/powerhouse.js" ]; then okay "plugin: $root/.opencode/plugin/powerhouse.js"
+elif [ -f "$global/plugin/powerhouse.js" ]; then okay "plugin: $global/plugin/powerhouse.js (global)"
+else fail "powerhouse plugin not installed (run install.sh)"; fi
+
+config=""
+for c in "$root/opencode.json" "$global/opencode.json"; do [ -f "$c" ] && { config=$c; break; }; done
+[ -n "$config" ] && okay "config: $config" || fail "no opencode.json found in $root or $global"
+command -v jq >/dev/null 2>&1 || { echo; echo "jq is required for the rest of the checks."; exit 1; }
+
+model=$(jq -r '.model // empty' "$config" 2>/dev/null)
+if [ -z "$model" ] && [ "$config" != "$global/opencode.json" ] && [ -f "$global/opencode.json" ]; then
+  model=$(jq -r '.model // empty' "$global/opencode.json")
+fi
+provider=${model%%/*} model_id=${model#*/}
+[ -n "$model" ] && okay "model: $model" || fail "no model set in opencode.json (\"model\": \"lmstudio/<model id>\")"
+small=$(jq -r '.small_model // empty' "$config" 2>/dev/null)
+if [ -n "$small" ] && [ "$small" != "$model" ]; then
+  warn "small_model ($small) differs from model: LM Studio would swap models for titles and summaries"
+fi
+lookup() { # lookup <jq path under the model> from the first config that has it
+  local c v
+  for c in "$config" "$global/opencode.json"; do
+    [ -f "$c" ] || continue
+    v=$(jq -r --arg p "$provider" --arg m "$model_id" ".provider[\$p].models[\$m]$1 // .provider[\$p]$1 // empty" "$c" 2>/dev/null)
+    [ -n "$v" ] && { echo "$v"; return; }
+  done
+}
+ctx=$(lookup '.limit.context'); out=$(lookup '.limit.output')
+base=$(lookup '.options.baseURL'); base=${base:-http://127.0.0.1:1234/v1}
+[ -n "$ctx" ] && okay "opencode limit.context $ctx, limit.output ${out:-unset}" || fail "limit.context not set for $model"
+
+echo "LM Studio ($base)"
+if ! models=$(curl -fsS --max-time 5 "$base/models" 2>/dev/null); then
+  fail "no server at $base (start it in LM Studio: Developer → Start Server, or 'lms server start')"
+else
+  okay "server is up"
+  printf '%s' "$models" | jq -e --arg m "$model_id" '.data[] | select(.id == $m)' >/dev/null 2>&1 \
+    && okay "model $model_id is available" || fail "model $model_id isn't in $base/models (check the id with 'lms ls')"
+  api=${base%/v1}/api/v0/models
+  if info=$(curl -fsS --max-time 5 "$api" 2>/dev/null); then
+    loaded=$(printf '%s' "$info" | jq -r '[.data[] | select(.state == "loaded") | .id] | join(", ")')
+    n=$(printf '%s' "$info" | jq '[.data[] | select(.state == "loaded")] | length')
+    case "$n" in
+      0) warn "no model loaded yet (it loads on the first request; load it yourself to set the context length)" ;;
+      1) okay "one model loaded: $loaded" ;;
+      *) warn "$n models loaded ($loaded): each one holds its own weights in memory; unload all but $model_id" ;;
+    esac
+    lctx=$(printf '%s' "$info" | jq -r --arg m "$model_id" '.data[] | select(.id == $m) | .loaded_context_length // empty')
+    if [ -n "$lctx" ] && [ -n "$ctx" ]; then
+      if [ "$lctx" = "$ctx" ]; then okay "LM Studio context $lctx = opencode limit.context"
+      elif [ "$lctx" -lt "$ctx" ]; then fail "LM Studio context $lctx < opencode limit.context $ctx: long sessions will overflow. Reload with: lms load $model_id --context-length $ctx"
+      else warn "LM Studio context $lctx > opencode limit.context $ctx: memory spent on context opencode never uses"; fi
+    else
+      warn "couldn't read the loaded context length; check it matches $ctx (lms ps)"
+    fi
+  else
+    warn "LM Studio's /api/v0 endpoint didn't answer; check the loaded context length by hand (lms ps)"
+  fi
+fi
+command -v lms >/dev/null 2>&1 && { echo "  lms ps:"; lms ps 2>/dev/null | sed 's/^/    /'; }
+
+echo "Memory"
+if [ -n "$ctx" ]; then
+  kv=$(( ctx * KV_BYTES_PER_TOKEN / 1048576 ))
+  printf '  info  KV cache for %s tokens ≈ %s MiB at fp16 (about half with Q8 KV cache), per running subagent\n' "$ctx" "$kv"
+fi
+if [ "$(uname -s)" = Darwin ]; then
+  ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  wired=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+  printf '  info  %s GB unified memory; GPU wired limit: %s\n' "$ram" "$([ "${wired:-0}" -gt 0 ] && echo "${wired} MB" || echo "macOS default (about 2/3 of RAM)")"
+  pressure=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/ {print $2}')
+  [ -n "$pressure" ] && printf '  info  system-wide memory free: %s\n' "$pressure"
+fi
+max=${POWERHOUSE_MAX_SUBAGENTS:-1}
+okay "subagents at once: $max (POWERHOUSE_MAX_SUBAGENTS; 1 or 2). Set LM Studio's max concurrent predictions to the same number."
+
+echo
+if [ "$problems" -gt 0 ]; then echo "$problems problem(s), $warnings warning(s)."; exit 1; fi
+echo "No problems. $warnings warning(s)."
