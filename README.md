@@ -97,6 +97,8 @@ The installer never overwrites `opencode.json`. It merges into it with a `.bak` 
 
 Then load the model (see above), restart opencode and run `.opencode/bin/powerhouse-doctor`.
 
+**Use opencode 1.x.** opencode 2.x can't load the plugin and keeps running without it, so every guardrail is off. [LOCAL-QWEN.md](LOCAL-QWEN.md) describes running opencode in an OrbStack container, driven from the Mac with `mac/ph`.
+
 ## Usage
 
 ```text
@@ -190,7 +192,7 @@ All 16 are `mode: subagent`, use the session's model, can't start other subagent
 ```bash
 tests/run.sh                    # needs git, jq, python3; runs the plugin tests too when bun is installed
 bun test tests/plugin.test.js   # plugin only
-shellcheck install.sh .opencode/hooks/*.sh .opencode/bin/select-reviewers .opencode/bin/powerhouse-doctor tests/run.sh
+shellcheck install.sh .opencode/hooks/*.sh .opencode/bin/select-reviewers .opencode/bin/powerhouse-doctor tests/run.sh mac/ph
 ```
 
 `tests/mock-llm.py` is a scripted OpenAI-compatible server. Point a scratch project's provider at it to watch opencode drive the agents, commands and plugin end to end (subagent cap, review capture, push gate) without loading a model.

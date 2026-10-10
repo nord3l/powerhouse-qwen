@@ -26,7 +26,7 @@ jobs:
           bun-version: 1.4.2
 
       - name: shellcheck
-        run: shellcheck install.sh .opencode/hooks/*.sh .opencode/bin/select-reviewers .opencode/bin/powerhouse-doctor tests/run.sh
+        run: shellcheck install.sh .opencode/hooks/*.sh .opencode/bin/select-reviewers .opencode/bin/powerhouse-doctor tests/run.sh mac/ph
 
       - name: tests
         run: tests/run.sh
