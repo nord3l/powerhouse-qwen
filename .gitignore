@@ -1,0 +1,4 @@
+# Review gate marker and saved reviewer results (per-machine, per-HEAD)
+.opencode/.review-status
+.opencode/.review/
+__pycache__/
